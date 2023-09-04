@@ -18,7 +18,10 @@ package raft
 //
 
 import (
+	"math"
 	"math/rand"
+	"runtime"
+	"sort"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -81,6 +84,10 @@ type Raft struct {
 	ElectionTimeoutPeriod   int
 	LastHeartBeatTime       time.Time
 	LastElectionTimeoutTime time.Time
+
+	// 2B
+	ApplyCond      sync.Cond
+	ReplicatorCond []*sync.Cond
 }
 
 type AppendEntriesArgs struct {
@@ -95,6 +102,9 @@ type AppendEntriesArgs struct {
 type AppendEntriesReply struct {
 	Term    int
 	Success bool
+
+	// 2B
+	PrevLogIndex int
 }
 
 // return currentTerm and whether this server
@@ -109,6 +119,19 @@ func (rf *Raft) GetState() (int, bool) {
 	term = rf.CurrentTerm
 	isleader = rf.State == Leader
 	return term, isleader
+}
+
+func (rf *Raft) ConvertId2State(id int8) string {
+	switch id {
+	case 0:
+		return "Leader"
+	case 1:
+		return "Follower"
+	case 2:
+		return "Candidate"
+	default:
+		return "none"
+	}
 }
 
 // save Raft's persistent state to stable storage,
@@ -196,7 +219,11 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	}
 
 	// 候选人的日志至少与接收者的日志一样最新，否则不授予投票
-	if args.LastLogTerm < rf.GetLastLog().Term || (args.LastLogTerm == rf.GetLastLog().Term && args.LastLogIndex < rf.GetLastLog().Index) {
+	if args.LastLogTerm < rf.GetLastLog().Term {
+		reply.CurrentTerm = rf.CurrentTerm
+		return
+	}
+	if args.LastLogTerm == rf.GetLastLog().Term && args.LastLogIndex < rf.GetLastLog().Index {
 		reply.CurrentTerm = rf.CurrentTerm
 		return
 	}
@@ -244,22 +271,98 @@ func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *Reques
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
+	reply.PrevLogIndex = args.PrevLogIndex
+	_, _, lineno, _ := runtime.Caller(0)
+	DPrintf("lineno(%v) reply.PrevLogIndex=%v\n", lineno, reply.PrevLogIndex)
+
+	// 2A
 	reply.Success = false
+	// 若Leaderd的任期小于Follower，则直接拒绝这次RPC
 	if args.LeaderTerm < rf.CurrentTerm {
 		reply.Term = rf.CurrentTerm
 		return
 	}
+
+	// 若当前节点的任期小于Leader发来的任期，则说明当前节点的任期已经过期，同步Follower节点状态
 	if args.LeaderTerm > rf.CurrentTerm {
 		rf.CurrentTerm = args.LeaderTerm
 		rf.VotedFor = -1
+		// 2C rf.persist()
 	}
+	// 执行到这，一定要将当前身份转变为Follower
 	rf.ToFollower()
 	rf.ResetElectionTimer()
+	// 2A
 
-	// @TODO: 日志是否匹配，2B
+	// 2B
+	if args.PrevLogIndex != 0 {
+		// 日志不匹配
+		// args.PrevLogIndex > rf.GetLastLog().Index为true，对应于figure 7中的(a)和(b)
+		//
+		// rf.Log[args.PrevLogIndex].Term != args.PrevLogTerm 说明，在Follower的日志中，
+		// 从args.PrevLogIndex或args.PrevLogIndex前面的某个位置开始往后，Follower的Log Entries与Leader中的Log Entries冲突，
+		// 返回false，Leader需要回退rf.NextIndex[peer]，找到哪个冲突的位置，
+		// 将从冲突的位置开始的Log Entries发送给Follower，覆盖Follower中冲突的Log Entries.
+		if args.PrevLogIndex > rf.GetLastLog().Index || rf.Log[args.PrevLogIndex].Term != args.PrevLogTerm {
+			reply.Success = false
+			reply.Term = args.LeaderTerm
+
+			// 对应于 figure 7 中的 Follower(d)
+			if args.PrevLogIndex <= rf.GetLastLog().Index {
+				// rf.log[args.PrevLogIndx:] = make([]LogEntry) 和 rf.Log = rf.Log[:args.PrevLogIndex] 的区别？？
+				rf.Log = rf.Log[:args.PrevLogIndex]
+				// rf.persist()
+			}
+			return
+		}
+	} else {
+		reply.Success = false
+		reply.Term = args.LeaderTerm
+		// DPrintf("args.PrevLogIndex = 0")
+	}
+
+	// 执行到这，说明通过了日志的一致性检查，Follower开始追加日志
+	// 补充：准确来讲，通过一致性检查找到了Leader和Follower日志一致的最高索引，
+	// 接下来Leader就可以进行日志覆盖了
+	if !rf.CheckFollowerLog(args.PrevLogIndex, args.Entries) { //youwenti
+		rf.Log = rf.Log[:args.PrevLogIndex+1]
+		rf.Log = append(rf.Log, args.Entries...)
+		// rf.persist()
+	}
+
+	// If leaderCommit > commitIndex, set commitIndex = min(leaderCommit, index of last new entry)
+	// 注意：不存在 Follower 的 CommittedIndex 大于 Leader 的 CommittedIndex 的情况。
+	if args.LeaderCommitedIndex > rf.CommitedIndex {
+		rf.CommitedIndex = int(math.Min(float64(args.LeaderCommitedIndex), float64(rf.GetLastLog().Index)))
+		// 说明 Leader's.log[rf.CommitedIndex:LeaderCommittedIndex+1]中的日志需要复制到 Follower 的本地日志中
+		// 因此 Leader 需要重复调用 AppendEntries RPC，以最终确定Follower的CommittedIndex与Leader的CommittedIndex一致
+		// 因此需要一个后台协程来监测并重复发起这种情况下的 AppendEntries RPC，
+		// 直到Follower的CommittedIndex与Leader的CommittedIndex一致，或者是将Follower中还未提交的Log Entry提交。
+		rf.ApplyCond.Signal()
+	}
 
 	reply.Term = args.LeaderTerm
 	reply.Success = true
+}
+
+// 采用一种相对朴素暴力的方法来检查Follower日志中prevLogIndex位置后的Log Entries和请求复制的日志logEntries之前的一致性。
+// 只要任一位置出现Log Entry不一致，就返回false，然后执行Leader的强制覆盖操作。
+// @TODO: 一个可以优化的方向为：返回开始不一致的
+func (rf *Raft) CheckFollowerLog(prevLogIndex int, logEntries []LogEntry) bool {
+	logs := rf.Log[prevLogIndex+1:]
+	if len(logs) == 0 {
+		return false
+	}
+	if len(logs) > len(logEntries) {
+		for i := 0; i < len(logEntries); i++ {
+			if logs[i].Index != logEntries[i].Index && logs[i].Term != logEntries[i].Term {
+				return false
+			}
+		}
+	} else {
+		return false
+	}
+	return true
 }
 
 func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *AppendEntriesReply) bool {
@@ -274,7 +377,7 @@ func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *Ap
 // command will ever be committed to the Raft log, since the leader
 // may fail or lose an election. even if the Raft instance has been killed,
 // this function should return gracefully.
-//
+
 // the first return value is the index that the command will appear at
 // if it's ever committed. the second return value is the current
 // term. the third return value is true if this server believes it is
@@ -285,8 +388,110 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	isLeader := true
 
 	// Your code here (2B).
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	if rf.State != Leader {
+		// 先由Leader将Log Entry复制到本地日志
+		return index, term, isLeader
+	}
+	DPrintf("{Node %v}'s state is %s\n", rf.me, rf.ConvertId2State(rf.State))
+	// 1.接收客户端发送地命令，并生成对应的 Log Entry，然后添加到 Leader 中的本地日志中
+	newLogEntry := LogEntry{rf.CurrentTerm, len(rf.Log), command}
+	DPrintf("{Node %v} receive a new commodidx[%v] to replicate in term %v", rf.me, newLogEntry, rf.CurrentTerm)
+	rf.Log = append(rf.Log, newLogEntry)
+	// 将 Log Entry 写入日志后，保存持久化状态，2C中实现
+	// rf.persist()
+	for i := range rf.peers {
+		rf.NextIndex[i] = rf.GetLastLog().Index
+	}
+	rf.MatchIndex[rf.me] = rf.GetLastLog().Index
+	// Leader 并发的向服务器中的其它节点发送 AppendEntries RPC，要求其它节点将该Log Entry添加到它们的本地日志中。
+	rf.BroadcastAppendEntries(false)
+	// 一次 AppendEntries RPC 和 一次心跳包类似，需要重置心跳包发送定时器
+	rf.ResetHeart()
 
+	index = newLogEntry.Index
+	term = rf.CurrentTerm
+	isLeader = true
 	return index, term, isLeader
+}
+
+func (rf *Raft) BroadcastAppendEntries(isHeartBeat bool) {
+	for peer := range rf.peers {
+		if peer == rf.me {
+			continue
+		}
+		if isHeartBeat {
+			DPrintf("Node{%v} send heartbeat to the Node{%v}", rf.me, peer)
+			go rf.ReplicateOneBound(peer)
+		} else {
+			DPrintf("Node{%v} start to replicate to the Node{%v}", rf.me, peer)
+			rf.ReplicatorCond[peer].Signal()
+		}
+	}
+}
+
+func (rf *Raft) ReplicateLogEntriresTo(peer int) {
+	rf.ReplicatorCond[peer].L.Lock()
+	defer rf.ReplicatorCond[peer].L.Unlock()
+	for !rf.killed() {
+		// 若日志不需要进行复制，则阻塞等待，等待被唤醒。
+		for !rf.CheckLogReplication(peer) {
+			rf.ReplicatorCond[peer].Wait()
+		}
+		// 在ReplicateOneBound函数内部调用 AppendEntries RPC，进行日志复制
+		// 若RPC因网络故障等原因调用失败，则Leader中的日志没有和该Follower节点完全一致，则CheckLogReplication检测再次失效
+		// 再次发起AppendEntries RPC调用，直到ReplicatorCond检测有效，进入阻塞，再次等待被唤醒。
+		rf.ReplicateOneBound(peer)
+	}
+}
+
+func (rf *Raft) CheckLogReplication(peer int) bool {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	// 注意理解这里的两个判断条件：
+	// 1. 只有Leader才被允许发送AppendEntries RPC
+	// 2. rf.MatchIndex[peer]表示，Leader已知rf.peers[perr]节点上日志的最高索引
+	// 因此 rf.MatchIndex[peer] < rf.GetLastLog().Index 说明当前时刻，Leader中存在还未复制到Follower的Log Entry。
+	return rf.State == Leader && rf.MatchIndex[peer] < rf.GetLastLog().Index
+}
+
+func (rf *Raft) ReplicateOneBound(peer int) {
+	rf.mu.Lock()
+	if rf.State != Leader {
+		DPrintf("Node %v is not Leader\n", rf.me)
+		rf.mu.Unlock()
+		return
+	}
+	// 获取这次AppendEntries RPC中，peer节点日志中从prevLogIndex索引处开始复制Log Entries.
+	prevLogIndex := rf.NextIndex[peer] - 1
+	if prevLogIndex < 0 {
+		DPrintf("Node(%v)'s send to peer(%v)'s prevLogIndex(%v) is 0", rf.me, peer, prevLogIndex)
+		prevLogIndex = 0
+	}
+
+	// 生成AppendEntriesArgs参数
+	args := AppendEntriesArgs{
+		LeaderTerm:   rf.CurrentTerm,
+		LeaderId:     rf.me,
+		PrevLogIndex: prevLogIndex,
+		PrevLogTerm:  rf.Log[prevLogIndex].Term,
+		// @TODO:
+		// 此处，Entries = rf.Log[rf.MatchIndex[peer]+1] 应该是等价的，
+		// 因为 rf.MatchIndex[peer] = rf.NextIndex[peer] - 1， 待验证
+		Entries:             rf.Log[prevLogIndex+1:],
+		LeaderCommitedIndex: rf.CommitedIndex,
+	}
+	rf.mu.Unlock()
+
+	reply := AppendEntriesReply{}
+	if rf.sendAppendEntries(peer, &args, &reply) {
+		rf.mu.Lock()
+		rf.ProcessAppendReply(peer, args, reply)
+		rf.mu.Unlock()
+	} else {
+		DPrintf("Node(%v) send AppendEntrie RPC fail\n", rf.me)
+	}
 }
 
 // the tester doesn't halt goroutines created by Raft after each test,
@@ -343,36 +548,16 @@ func (rf *Raft) BroadcastHeartBeat() {
 			continue
 		}
 		// 发送心跳包给 rf.peers[peer]
-		go rf.SendHeartBeatTo(peer)
+		DPrintf("Node(%v) send heartbeat to Node(%v)\n", rf.me, peer)
+		go rf.ReplicateOneBound(peer)
 	}
 }
 
-func (rf *Raft) SendHeartBeatTo(peer int) {
-	rf.mu.Lock()
-	if rf.State != Leader {
-		rf.mu.Unlock()
-		return
-	}
-	args := AppendEntriesArgs{
-		LeaderTerm:          rf.CurrentTerm,
-		LeaderId:            rf.me,
-		PrevLogIndex:        rf.GetLastLog().Index,
-		PrevLogTerm:         rf.GetLastLog().Term,
-		Entries:             make([]LogEntry, 0),
-		LeaderCommitedIndex: rf.CommitedIndex,
-	}
-	rf.mu.Unlock()
-	reply := AppendEntriesReply{}
-	// 对于发送心跳包，AppendEntries 中的 Entries 字段为空
-	if rf.sendAppendEntries(peer, &args, &reply) {
-		rf.mu.Lock()
-		rf.ProcessAppendReply(peer, &args, &reply)
-		rf.mu.Unlock()
-	}
-	// else
-}
+func (rf *Raft) ProcessAppendReply(peer int, args AppendEntriesArgs, reply AppendEntriesReply) {
+	reply.PrevLogIndex = int(math.Min(float64(reply.PrevLogIndex), float64(rf.NextIndex[peer])))
+	_, _, lineno, _ := runtime.Caller(0)
+	DPrintf("lineno(%v) reply.PrevLogIndex=%v\n", lineno, reply.PrevLogIndex)
 
-func (rf *Raft) ProcessAppendReply(peer int, args *AppendEntriesArgs, reply *AppendEntriesReply) {
 	if rf.State != Leader || rf.CurrentTerm != args.LeaderTerm {
 		return
 	}
@@ -381,19 +566,55 @@ func (rf *Raft) ProcessAppendReply(peer int, args *AppendEntriesArgs, reply *App
 		rf.ToFollower()
 		rf.CurrentTerm = reply.Term
 		rf.VotedFor = -1
+		// rf.persist()
 		return
 	}
 	// if !reply.Success && reply.Term < arg.LeaderTerm
+
+	// 日志不一致，回退 rf.NextIndex 进行重试
 	if !reply.Success && reply.Term == args.LeaderTerm {
-		// 日志不一致，需要减少 rf.NextIndex 进行重试，在 2A 中暂时不需要考虑
-		DPrintf("日志不一致")
+		DPrintf("Node(%v)'s peer(%v), prevLogIndex is %v\n", rf.me, peer, rf.NextIndex[peer]-1)
+		// 根据论文中第7页右下方和第8页右上方的优化技巧，Leader减小nextIndex一次性越过该冲突任期的所有日志条目。
+		rf.NextIndex[peer] = rf.GetPrevTermLogEntryIndex(reply.PrevLogIndex)
+		if rf.NextIndex[peer] < rf.MatchIndex[peer]+1 {
+			rf.NextIndex[peer] = rf.MatchIndex[peer] + 1
+		}
+		return
 	}
 
 	if reply.Success {
-		// DPrintf("success.")
+		DPrintf("success.")
+		rf.NextIndex[peer] = reply.PrevLogIndex + 1 + len(args.Entries)
+		rf.MatchIndex[peer] = int(math.Max(float64(rf.NextIndex[peer]-1), float64(rf.MatchIndex[peer])))
+
+		// If there exists an N such that N > commitIndex,
+		// a majority of matchIndex[i] ≥ N, and log[N].term == currentTerm: set commitIndex = N (§5.3, §5.4).
+		matchIndex := make([]int, 0)
+		for i := 0; i < len(rf.peers); i++ {
+			if rf.me != i {
+				matchIndex = append(matchIndex, rf.MatchIndex[i])
+			}
+		}
+		matchIndex = append(matchIndex, rf.GetLastLog().Index)
+		sort.Ints(matchIndex)
+		commitIndex := matchIndex[(len(matchIndex))/2]
+		if commitIndex > rf.CommitedIndex && rf.Log[commitIndex].Term == rf.CurrentTerm {
+			rf.CommitedIndex = commitIndex
+			rf.ApplyCond.Signal()
+		}
 	} else {
 		rf.ToFollower()
 	}
+}
+
+func (rf *Raft) GetPrevTermLogEntryIndex(prevLogIndex int) int {
+	prevTerm := rf.Log[prevLogIndex].Term
+	for i := prevLogIndex - 1; i >= 0; i-- {
+		if rf.Log[i].Term != prevTerm {
+			return rf.Log[i].Index + 1
+		}
+	}
+	return 1
 }
 
 // 开始一次选举的过程如下：
@@ -421,6 +642,7 @@ func (rf *Raft) ElectionAction() {
 				// 这一步的判断很重要
 				// 目的是为了防止在这个 goroutine 执行前，rf.State 因某些原因导致状态发生变化.
 				// 在测试的时候，可以尝试把下面这个判断条件注释掉，看看测试结果
+				// 实验2A中，没有该条件判断能正常通过。
 				if rf.State != Candidate {
 					rf.mu.Unlock()
 					return
@@ -443,7 +665,7 @@ func (rf *Raft) ElectionAction() {
 								// Candidate -> Leader，并发地向其他服务器发送心跳包，维护Leader身份
 								rf.ToLeader()
 								// 并发发送心跳包
-								rf.BroadcastHeartBeat()
+								rf.BroadcastAppendEntries(true)
 								// 重置心跳包定时器
 								rf.ResetHeart()
 							}
@@ -475,14 +697,15 @@ func (rf *Raft) Heart() {
 		rf.mu.Lock()
 		if rf.HeartBeatIsTimeout() {
 			if rf.State == Leader {
-				rf.BroadcastHeartBeat()
+				rf.BroadcastAppendEntries(true)
 				rf.ResetHeart()
 			}
 		}
 		rf.mu.Unlock()
 
-		// t := 30 + (rand.Int63() % 5)
-		time.Sleep(time.Duration(rf.HeartBeatTimeoutPeriod) * time.Millisecond)
+		t := 30 + (rand.Int63() % 5)
+		time.Sleep(time.Duration(t) * time.Millisecond)
+		// time.Sleep(time.Duration(rf.HeartBeatTimeoutPeriod) * time.Millisecond)
 	}
 }
 
@@ -504,6 +727,39 @@ func (rf *Raft) ticker() {
 		// 定时检测是否发选举超时
 		t := 50 + (rand.Int63() % 300)
 		time.Sleep(time.Duration(t) * time.Millisecond)
+	}
+}
+
+// 后台线程
+func (rf *Raft) ApplyLogEntries() {
+	for !rf.killed() {
+		rf.mu.Lock()
+
+		// rf.LastAppliedIndex < rf.CommitedIndex && rf.GetLastLog().Index+1 > rf.CommitedIndex
+		//
+		for rf.LastAppliedIndex >= rf.CommitedIndex || rf.GetLastLog().Index+1 <= rf.CommitedIndex {
+			DPrintf("wait to signal.")
+			rf.ApplyCond.Wait()
+			rf.CommitedIndex = int(math.Min(float64(rf.CommitedIndex), float64(rf.GetLastLog().Index)))
+		}
+
+		DPrintf("Node(%v)'s CommittedIndex=%v, LastAppliedIndex=%v\n", rf.me, rf.CommitedIndex, rf.LastAppliedIndex)
+		entries := make([]LogEntry, rf.CommitedIndex-rf.LastAppliedIndex)
+		copy(entries, rf.Log[rf.LastAppliedIndex+1:rf.CommitedIndex+1])
+		committedIndex := rf.CommitedIndex
+		// rf.mu.Unlock()
+		DPrintf("Node(%v) apply Log to state machine\n", rf.me)
+		for _, entry := range entries {
+			rf.ApplyCh <- ApplyMsg{
+				CommandValid: true,
+				Command:      entry.Command,
+				CommandIndex: entry.Index,
+			}
+		}
+		// rf.mu.Lock()
+		rf.LastAppliedIndex = int(math.Max(float64(rf.LastAppliedIndex), float64(committedIndex)))
+		DPrintf("LastAppliedIndex=%v\n", rf.LastAppliedIndex)
+		rf.mu.Unlock()
 	}
 }
 
@@ -537,18 +793,27 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.NextIndex = make([]int, len(rf.peers))
 	rf.MatchIndex = make([]int, len(rf.peers))
 	rf.ApplyCh = applyCh
+	rf.ReplicatorCond = make([]*sync.Cond, len(rf.peers))
+	rf.ApplyCond = *sync.NewCond(&rf.mu)
 	for peer := range rf.peers {
 		rf.NextIndex[peer] = 1
 		rf.MatchIndex[peer] = 0
-		//
+		if peer != rf.me {
+			rf.ReplicatorCond[peer] = sync.NewCond(&sync.Mutex{})
+			// 后台 goroutine 等待信号量的唤醒，流程如下：
+			// 1.Leader收到客户端发来的请求后，将请求命令先写入自己的本地日志中，然后并发的向其它节点发送 AppendEntries RPC，
+			// 2.并发 AppendEntries RPC 通过信号量机制通知后台goroutine，后台goroutine被唤醒；
+			// 3.后台goroutine负责执行真正的复制Log Entries操作
+			go rf.ReplicateLogEntriresTo(peer)
+		}
 	}
 
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
 
-	// for peer := range rf.peers {
-	// 	rf.NextIndex[peer] = rf.GetLastLog().Index + 1
-	// }
+	for peer := range rf.peers {
+		rf.NextIndex[peer] = rf.GetLastLog().Index + 1
+	}
 
 	// create a background goroutine that will kick off leader election periodically
 	// by sending out RequestVote RPCs when it hasn't heard from another peer for a while.
@@ -556,6 +821,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	go rf.ticker()
 	// DPrintf("go ticker.")
 	go rf.Heart()
+	go rf.ApplyLogEntries()
 
 	return rf
 }
