@@ -18,14 +18,15 @@ package raft
 //
 
 import (
+	"bytes"
 	"math"
 	"math/rand"
-	"runtime"
 	"sort"
 	"sync"
 	"sync/atomic"
 	"time"
 
+	"Raft/labgob"
 	"Raft/labrpc"
 )
 
@@ -146,6 +147,14 @@ func (rf *Raft) persist() {
 	// e.Encode(rf.yyy)
 	// data := w.Bytes()
 	// rf.persister.SaveRaftState(data)
+
+	w := new(bytes.Buffer)
+	e := labgob.NewEncoder(w)
+	e.Encode(rf.CurrentTerm)
+	e.Encode(rf.Log)
+	e.Encode(rf.VotedFor)
+	data := w.Bytes()
+	rf.persister.SaveRaftState(data)
 }
 
 // restore previously persisted state.
@@ -166,6 +175,19 @@ func (rf *Raft) readPersist(data []byte) {
 	//   rf.xxx = xxx
 	//   rf.yyy = yyy
 	// }
+
+	r := bytes.NewBuffer(data)
+	d := labgob.NewDecoder(r)
+	var CurrentTerm, VotedFor int
+	var Log []LogEntry
+	if d.Decode(&CurrentTerm) != nil || d.Decode(&Log) != nil || d.Decode(&VotedFor) != nil {
+		DPrintf("Node{%v} failed readPersist", rf.me)
+	} else {
+		rf.CurrentTerm = CurrentTerm
+		rf.Log = Log
+		rf.VotedFor = VotedFor
+	}
+
 }
 
 // example RequestVote RPC arguments structure.
@@ -203,6 +225,8 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 	reply.VoteGranted = false
+
+	// If votedFor is null or candidateId, and candidate’s log is at least as up-to-date as receiver’s log, grant vote (§5.2, §5.4)
 	if rf.CurrentTerm > args.CandidateTerm || (rf.CurrentTerm == args.CandidateTerm && rf.VotedFor != -1 && rf.VotedFor != args.CandidateId) {
 		reply.CurrentTerm = rf.CurrentTerm
 		return
@@ -215,10 +239,11 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		rf.ToFollower()
 
 		// 2C
-		// rf.persist()
+		rf.persist()
 	}
 
 	// 候选人的日志至少与接收者的日志一样最新，否则不授予投票
+	// 根据(term, index) 来判断谁的日志更新
 	if args.LastLogTerm < rf.GetLastLog().Term {
 		reply.CurrentTerm = rf.CurrentTerm
 		return
@@ -229,9 +254,11 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	}
 
 	rf.VotedFor = args.CandidateId
+	rf.ResetElectionTimer()
+	rf.ToFollower()
+	rf.persist()
 	reply.CurrentTerm = rf.CurrentTerm
 	reply.VoteGranted = true
-	rf.ResetElectionTimer()
 }
 
 // example code to send a RequestVote RPC to a server.
@@ -272,8 +299,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 	reply.PrevLogIndex = args.PrevLogIndex
-	_, _, lineno, _ := runtime.Caller(0)
-	DPrintf("lineno(%v) reply.PrevLogIndex=%v\n", lineno, reply.PrevLogIndex)
+	DPrintf("reply.PrevLogIndex=%v\n", reply.PrevLogIndex)
 
 	// 2A
 	reply.Success = false
@@ -288,7 +314,9 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		rf.CurrentTerm = args.LeaderTerm
 		rf.VotedFor = -1
 		// 2C rf.persist()
+		rf.persist()
 	}
+	// 一个隐式的条件，rf.CurrentTerm == args.LeaderTerm
 	// 执行到这，一定要将当前身份转变为Follower
 	rf.ToFollower()
 	rf.ResetElectionTimer()
@@ -311,7 +339,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 			if args.PrevLogIndex <= rf.GetLastLog().Index {
 				// rf.log[args.PrevLogIndx:] = make([]LogEntry) 和 rf.Log = rf.Log[:args.PrevLogIndex] 的区别？？
 				rf.Log = rf.Log[:args.PrevLogIndex]
-				// rf.persist()
+				rf.persist()
 			}
 			return
 		}
@@ -324,14 +352,16 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	// 执行到这，说明通过了日志的一致性检查，Follower开始追加日志
 	// 补充：准确来讲，通过一致性检查找到了Leader和Follower日志一致的最高索引，
 	// 接下来Leader就可以进行日志覆盖了
+
 	if !rf.CheckFollowerLog(args.PrevLogIndex, args.Entries) { //youwenti
 		rf.Log = rf.Log[:args.PrevLogIndex+1]
 		rf.Log = append(rf.Log, args.Entries...)
-		// rf.persist()
+		rf.persist()
 	}
 
 	// If leaderCommit > commitIndex, set commitIndex = min(leaderCommit, index of last new entry)
 	// 注意：不存在 Follower 的 CommittedIndex 大于 Leader 的 CommittedIndex 的情况。
+	rf.CurrentTerm = args.LeaderTerm
 	if args.LeaderCommitedIndex > rf.CommitedIndex {
 		rf.CommitedIndex = int(math.Min(float64(args.LeaderCommitedIndex), float64(rf.GetLastLog().Index)))
 		// 说明 Leader's.log[rf.CommitedIndex:LeaderCommittedIndex+1]中的日志需要复制到 Follower 的本地日志中
@@ -340,14 +370,14 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		// 直到Follower的CommittedIndex与Leader的CommittedIndex一致，或者是将Follower中还未提交的Log Entry提交。
 		rf.ApplyCond.Signal()
 	}
-
+	rf.persist()
 	reply.Term = args.LeaderTerm
 	reply.Success = true
 }
 
 // 采用一种相对朴素暴力的方法来检查Follower日志中prevLogIndex位置后的Log Entries和请求复制的日志logEntries之前的一致性。
 // 只要任一位置出现Log Entry不一致，就返回false，然后执行Leader的强制覆盖操作。
-// @TODO: 一个可以优化的方向为：返回开始不一致的
+// @TODO: 一个可以优化的方向为：返回开始不一致的Log Entry的索引下标，只从不一致的位置开始覆盖，减小复制的开销。
 func (rf *Raft) CheckFollowerLog(prevLogIndex int, logEntries []LogEntry) bool {
 	logs := rf.Log[prevLogIndex+1:]
 	if len(logs) == 0 {
@@ -382,6 +412,19 @@ func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *Ap
 // if it's ever committed. the second return value is the current
 // term. the third return value is true if this server believes it is
 // the leader.
+//
+// 1.Leader收到命令，追加到本地日志中。
+// 2.并发地向其它的节点发送 AppendEntries RPC，等待节点响应。
+// 3.Follower节点收到 AppendEntries RPC，进行日志的一致性检验；
+//
+//	a.若检验通过，将AppendEntries中携带的Log Entry追加到Follower本地日志中，并告知Leader我复制了你发来的Log Entry。（响应成功）
+//	b.若检验失败，则携带一些信息（）告知Leader，你发来的Log Entry和我本地的Log Entry有冲突。（响应失败）
+//
+// 4.Leader收到大多数节点的成功响应后，更新 committed index。已提交的（committed）Log Entry就可以安全地应用于状态机了。
+//
+//	需要注意的是，Leader更新了committed index，但是Follower还没有更新 committedIndex。
+//	因此 Leader 在更新了 committed Index 后，需要通过再次发送心跳包给 Follower节点，将committed index作为 AppendEntrie RPC 的 leaderCommitt 参数发送。
+//	并且需要收到所有的 Follower 节点对该心跳包的响应，若没有收到该节点的响应，则会一致重复发送直至收到成功响应。
 func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	index := -1
 	term := -1
@@ -392,7 +435,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	defer rf.mu.Unlock()
 	if rf.State != Leader {
 		// 先由Leader将Log Entry复制到本地日志
-		return index, term, isLeader
+		return -1, -1, false
 	}
 	DPrintf("{Node %v}'s state is %s\n", rf.me, rf.ConvertId2State(rf.State))
 	// 1.接收客户端发送地命令，并生成对应的 Log Entry，然后添加到 Leader 中的本地日志中
@@ -400,11 +443,18 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	DPrintf("{Node %v} receive a new commodidx[%v] to replicate in term %v", rf.me, newLogEntry, rf.CurrentTerm)
 	rf.Log = append(rf.Log, newLogEntry)
 	// 将 Log Entry 写入日志后，保存持久化状态，2C中实现
-	// rf.persist()
+	rf.persist()
+
+	// -----------
+	//
 	for i := range rf.peers {
 		rf.NextIndex[i] = rf.GetLastLog().Index
 	}
+	// matchIndex只有在Follower正确响应了AppendEntries RPC时才进行更新。
+	// 应该更新为 matchIndex = prevLogIndex +len(entries[])
 	rf.MatchIndex[rf.me] = rf.GetLastLog().Index
+	// -----------
+
 	// Leader 并发的向服务器中的其它节点发送 AppendEntries RPC，要求其它节点将该Log Entry添加到它们的本地日志中。
 	rf.BroadcastAppendEntries(false)
 	// 一次 AppendEntries RPC 和 一次心跳包类似，需要重置心跳包发送定时器
@@ -422,10 +472,10 @@ func (rf *Raft) BroadcastAppendEntries(isHeartBeat bool) {
 			continue
 		}
 		if isHeartBeat {
-			DPrintf("Node{%v} send heartbeat to the Node{%v}", rf.me, peer)
+			DPrintf("Node(%v) send heartbeat to the Node(%v)", rf.me, peer)
 			go rf.ReplicateOneBound(peer)
 		} else {
-			DPrintf("Node{%v} start to replicate to the Node{%v}", rf.me, peer)
+			DPrintf("Node(%v) start to replicate to the Node(%v)", rf.me, peer)
 			rf.ReplicatorCond[peer].Signal()
 		}
 	}
@@ -439,8 +489,8 @@ func (rf *Raft) ReplicateLogEntriresTo(peer int) {
 		for !rf.CheckLogReplication(peer) {
 			rf.ReplicatorCond[peer].Wait()
 		}
-		// 在ReplicateOneBound函数内部调用 AppendEntries RPC，进行日志复制
-		// 若RPC因网络故障等原因调用失败，则Leader中的日志没有和该Follower节点完全一致，则CheckLogReplication检测再次失效
+		// 在ReplicateOneBound函数内部调用 AppendEntries RPC，进行日志复制，
+		// 若RPC因网络故障等原因调用失败，则Leader中的日志没有和该Follower节点完全一致，则CheckLogReplication检测再次失效，
 		// 再次发起AppendEntries RPC调用，直到ReplicatorCond检测有效，进入阻塞，再次等待被唤醒。
 		rf.ReplicateOneBound(peer)
 	}
@@ -452,7 +502,7 @@ func (rf *Raft) CheckLogReplication(peer int) bool {
 	// 注意理解这里的两个判断条件：
 	// 1. 只有Leader才被允许发送AppendEntries RPC
 	// 2. rf.MatchIndex[peer]表示，Leader已知rf.peers[perr]节点上日志的最高索引
-	// 因此 rf.MatchIndex[peer] < rf.GetLastLog().Index 说明当前时刻，Leader中存在还未复制到Follower的Log Entry。
+	// 因此 rf.MatchIndex[peer] < rf.GetLastLog().Index 说明当前时刻，Leader中存在还未复制到Follower的Log Entry，因此返回true。
 	return rf.State == Leader && rf.MatchIndex[peer] < rf.GetLastLog().Index
 }
 
@@ -541,32 +591,25 @@ func (rf *Raft) ToFollower() {
 	rf.State = Follower
 }
 
-// rf.peers[rf.me] 向集群中的其他服务器发送心跳包
-func (rf *Raft) BroadcastHeartBeat() {
-	for peer := range rf.peers {
-		if peer == rf.me {
-			continue
-		}
-		// 发送心跳包给 rf.peers[peer]
-		DPrintf("Node(%v) send heartbeat to Node(%v)\n", rf.me, peer)
-		go rf.ReplicateOneBound(peer)
-	}
-}
-
 func (rf *Raft) ProcessAppendReply(peer int, args AppendEntriesArgs, reply AppendEntriesReply) {
 	reply.PrevLogIndex = int(math.Min(float64(reply.PrevLogIndex), float64(rf.NextIndex[peer])))
-	_, _, lineno, _ := runtime.Caller(0)
-	DPrintf("lineno(%v) reply.PrevLogIndex=%v\n", lineno, reply.PrevLogIndex)
+	// DPrintf("reply.PrevLogIndex=%v\n", reply.PrevLogIndex)
 
+	// 需要注意的是，Leader 向 Follower 发送 AppendEntries RPC（包括心跳包）后需要接收Follower的响应。
+	// 这是一个有来有回的过程，Leader 需要根据 Follower 的响应来判断 Follower 是否正确收到了Leader发送的AppendEntries RPC（包括心跳包）。
+	// Leader收到Follower的响应后，首先需要判断的是，发送日志时的Leader的任期和现在Leader的任期是否一致。
+	// 任期不一致说明，在发送AppendEntries RPC之后，收到Follower响应之前，Leader发生了变更,直接丢这个响应。
 	if rf.State != Leader || rf.CurrentTerm != args.LeaderTerm {
 		return
 	}
+
+	// rf.State == Leader && rf.CurrentTerm == args.LeaderTerm
 	// 发现更大term的candidate, 转变为follwer
 	if !reply.Success && reply.Term > args.LeaderTerm {
 		rf.ToFollower()
 		rf.CurrentTerm = reply.Term
 		rf.VotedFor = -1
-		// rf.persist()
+		rf.persist()
 		return
 	}
 	// if !reply.Success && reply.Term < arg.LeaderTerm
@@ -586,6 +629,7 @@ func (rf *Raft) ProcessAppendReply(peer int, args AppendEntriesArgs, reply Appen
 		DPrintf("success.")
 		rf.NextIndex[peer] = reply.PrevLogIndex + 1 + len(args.Entries)
 		rf.MatchIndex[peer] = int(math.Max(float64(rf.NextIndex[peer]-1), float64(rf.MatchIndex[peer])))
+		// rf.MatchIndex[peer] = rf.NextIndex[peer] - 1
 
 		// If there exists an N such that N > commitIndex,
 		// a majority of matchIndex[i] ≥ N, and log[N].term == currentTerm: set commitIndex = N (§5.3, §5.4).
@@ -597,7 +641,7 @@ func (rf *Raft) ProcessAppendReply(peer int, args AppendEntriesArgs, reply Appen
 		}
 		matchIndex = append(matchIndex, rf.GetLastLog().Index)
 		sort.Ints(matchIndex)
-		commitIndex := matchIndex[(len(matchIndex))/2]
+		commitIndex := matchIndex[len(matchIndex)/2]
 		if commitIndex > rf.CommitedIndex && rf.Log[commitIndex].Term == rf.CurrentTerm {
 			rf.CommitedIndex = commitIndex
 			rf.ApplyCond.Signal()
@@ -626,6 +670,7 @@ func (rf *Raft) ElectionAction() {
 	rf.CurrentTerm++
 	rf.State = Candidate
 	rf.VotedFor = rf.me
+	rf.persist()
 	votedCnt := 1
 
 	args := RequestVoteArgs{
@@ -642,7 +687,8 @@ func (rf *Raft) ElectionAction() {
 				// 这一步的判断很重要
 				// 目的是为了防止在这个 goroutine 执行前，rf.State 因某些原因导致状态发生变化.
 				// 在测试的时候，可以尝试把下面这个判断条件注释掉，看看测试结果
-				// 实验2A中，没有该条件判断能正常通过。
+				// 实验2A中，没有该条件判断能正常通过。在实验2B中，也正常通过。
+				// 我猜测，在测试中，Candidate过期的时间粒度不够细，需要查看测试代码进行验证。
 				if rf.State != Candidate {
 					rf.mu.Unlock()
 					return
@@ -675,6 +721,7 @@ func (rf *Raft) ElectionAction() {
 							rf.ToFollower()
 							rf.CurrentTerm = reply.CurrentTerm
 							rf.VotedFor = -1
+							rf.persist()
 						}
 					}
 					// else {}
@@ -730,15 +777,23 @@ func (rf *Raft) ticker() {
 	}
 }
 
-// 后台线程
+// 后台线程，将已提交（committed）但还未应用到状态机的命令应用到状态机中
 func (rf *Raft) ApplyLogEntries() {
 	for !rf.killed() {
 		rf.mu.Lock()
 
 		// rf.LastAppliedIndex < rf.CommitedIndex && rf.GetLastLog().Index+1 > rf.CommitedIndex
 		//
-		for rf.LastAppliedIndex >= rf.CommitedIndex || rf.GetLastLog().Index+1 <= rf.CommitedIndex {
-			DPrintf("wait to signal.")
+		// for rf.LastAppliedIndex >= rf.CommitedIndex || rf.GetLastLog().Index+1 <= rf.CommitedIndex {
+		// 	// DPrintf("wait to signal.")
+		// 	rf.ApplyCond.Wait()
+		// 	rf.CommitedIndex = int(math.Min(float64(rf.CommitedIndex), float64(rf.GetLastLog().Index)))
+		// }
+
+		// 当没有新的已提交的（committed）Log Entry 可以应用于状态机时，进入下面的循环后，
+		// 会被 Wait() 阻塞，然后等待
+		for rf.LastAppliedIndex >= rf.CommitedIndex {
+			// DPrintf("wait to signal.")
 			rf.ApplyCond.Wait()
 			rf.CommitedIndex = int(math.Min(float64(rf.CommitedIndex), float64(rf.GetLastLog().Index)))
 		}
@@ -747,7 +802,7 @@ func (rf *Raft) ApplyLogEntries() {
 		entries := make([]LogEntry, rf.CommitedIndex-rf.LastAppliedIndex)
 		copy(entries, rf.Log[rf.LastAppliedIndex+1:rf.CommitedIndex+1])
 		committedIndex := rf.CommitedIndex
-		// rf.mu.Unlock()
+		rf.mu.Unlock()
 		DPrintf("Node(%v) apply Log to state machine\n", rf.me)
 		for _, entry := range entries {
 			rf.ApplyCh <- ApplyMsg{
@@ -756,7 +811,7 @@ func (rf *Raft) ApplyLogEntries() {
 				CommandIndex: entry.Index,
 			}
 		}
-		// rf.mu.Lock()
+		rf.mu.Lock()
 		rf.LastAppliedIndex = int(math.Max(float64(rf.LastAppliedIndex), float64(committedIndex)))
 		DPrintf("LastAppliedIndex=%v\n", rf.LastAppliedIndex)
 		rf.mu.Unlock()
