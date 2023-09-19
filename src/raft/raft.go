@@ -237,8 +237,6 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		rf.CurrentTerm = args.CandidateTerm
 		rf.VotedFor = -1
 		rf.ToFollower()
-
-		// 2C
 		rf.persist()
 	}
 
@@ -781,14 +779,6 @@ func (rf *Raft) ticker() {
 func (rf *Raft) ApplyLogEntries() {
 	for !rf.killed() {
 		rf.mu.Lock()
-
-		// rf.LastAppliedIndex < rf.CommitedIndex && rf.GetLastLog().Index+1 > rf.CommitedIndex
-		//
-		// for rf.LastAppliedIndex >= rf.CommitedIndex || rf.GetLastLog().Index+1 <= rf.CommitedIndex {
-		// 	// DPrintf("wait to signal.")
-		// 	rf.ApplyCond.Wait()
-		// 	rf.CommitedIndex = int(math.Min(float64(rf.CommitedIndex), float64(rf.GetLastLog().Index)))
-		// }
 
 		// 当没有新的已提交的（committed）Log Entry 可以应用于状态机时，进入下面的循环后，
 		// 会被 Wait() 阻塞，然后等待
