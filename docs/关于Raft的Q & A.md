@@ -4,7 +4,7 @@ Raft 是一种共识算法，用来解决分布式环境下服务器节点的数
 
 >Consensus algorithms allow a collection of machines to work as a coherent group that can survive the failures of some of its members.
 
-共识算法保证了一群节点对外提供的服务像一台单独的节点对外提供服务一样，当集群中的少数节点出现故障时，任然能正常的像一个节点一样对外提供服务。
+共识算法保证了一群节点对外提供的服务像一台单独的节点对外提供服务一样，当集群中的少数节点出现故障时，仍然能正常的像一个节点一样对外提供服务。
 
 使用 Raft 的应用有分布式键值存储数据库，[etcd](https://github.com/etcd-io/etcd) 和 [TiKV](https://github.com/tikv/tikv)。
 
